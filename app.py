@@ -9,7 +9,7 @@ from psycopg2.extras import RealDictCursor
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDtP48zIe7YKKpABSR9h9LtdmAvo5JrEsc")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 DB_HOST     = os.environ.get("DB_HOST",     "aws-1-ap-northeast-2.pooler.supabase.com")
 DB_NAME     = os.environ.get("DB_NAME",     "postgres")
 DB_USER     = os.environ.get("DB_USER",     "postgres.cqlahdbkrddqrjgxaxws")
@@ -835,68 +835,96 @@ def employee_profile():
 # ─────────────────────────────────────────────
 #  AI PROXY (Google Gemini)
 # ─────────────────────────────────────────────
-def call_gemini(prompt, system=''):
-    full_prompt = f"{system}\n\n{prompt}" if system else prompt
-    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-           f"gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}")
+def call_groq(messages):
+    url = "https://api.groq.com/openai/v1/chat/completions"
     payload = {
-        'contents': [{'role': 'user', 'parts': [{'text': full_prompt}]}],
-        'generationConfig': {'maxOutputTokens': 800, 'temperature': 0.7}
+        "model": "llama-3.1-8b-instant",
+        "messages": messages,
+        "max_tokens": 800,
+        "temperature": 0.7
     }
     last_err = None
     for attempt in range(3):
         try:
-            return http_requests.post(
-                url, headers={'Content-Type': 'application/json'},
-                json=payload, timeout=45)
+            resp = http_requests.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {GROQ_API_KEY}"
+                },
+                json=payload,
+                timeout=45
+            )
+            return resp
         except Exception as e:
             last_err = e
             time.sleep(2 * (attempt + 1))
     raise last_err
 
-def extract_gemini_text(result):
-    candidates = result.get('candidates', [])
-    if not candidates:
-        msg = result.get('error', {}).get('message', 'No candidates returned.')
-        return None, msg
-    parts = candidates[0].get('content', {}).get('parts', [])
-    if not parts:
-        return None, 'Empty response from Gemini.'
-    text = parts[0].get('text', '').strip()
-    return (text, None) if text else (None, 'Empty text from Gemini.')
+def extract_groq_text(result):
+    # result might be a string if JSON parsing failed
+    if isinstance(result, str):
+        return None, f"Groq returned unexpected response: {result[:200]}"
+    if not isinstance(result, dict):
+        return None, "Invalid response from Groq."
+    # Check for API error
+    error = result.get("error")
+    if error:
+        if isinstance(error, dict):
+            msg = error.get("message", str(error))
+        else:
+            msg = str(error)
+        return None, f"Groq API error: {msg}"
+    choices = result.get("choices", [])
+    if not choices:
+        return None, f"No choices in Groq response: {str(result)[:200]}"
+    message = choices[0].get("message")
+    if not message:
+        return None, "No message in Groq response."
+    text = message.get("content", "").strip()
+    return (text, None) if text else (None, "Empty content from Groq.")
 
-@app.route('/api/ai/chat', methods=['POST'])
+@app.route("/api/ai/chat", methods=["POST"])
 def ai_chat():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
+    if "user_id" not in session:
+        return jsonify({"error": "Unauthorized"}), 401
     data     = request.json or {}
-    system   = data.get('system', '')
-    messages = data.get('messages', [])
-    history  = ''.join(
-        f"{'User' if m['role']=='user' else 'Assistant'}: {m['content']}\n"
-        for m in messages)
-    try:
-        resp = call_gemini(history, system)
-        text, err = extract_gemini_text(resp.json())
-        if err:
-            return jsonify({'error': err}), 500
-        return jsonify({'reply': text})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    system   = data.get("system", "")
+    messages = data.get("messages", [])
 
-@app.route('/api/ai/draft', methods=['POST'])
-def ai_draft():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-    data = request.json or {}
+    groq_messages = []
+    if system:
+        groq_messages.append({"role": "system", "content": system})
+    for m in messages:
+        groq_messages.append({"role": m["role"], "content": m["content"]})
+
     try:
-        resp = call_gemini(data.get('prompt', ''))
-        text, err = extract_gemini_text(resp.json())
+        resp = call_groq(groq_messages)
+        print(f"Groq status: {resp.status_code}, body: {resp.text[:300]}")
+        result = resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text
+        text, err = extract_groq_text(result)
         if err:
-            return jsonify({'error': err}), 500
-        return jsonify({'reply': text})
+            return jsonify({"error": err}), 500
+        return jsonify({"reply": text})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/ai/draft", methods=["POST"])
+def ai_draft():
+    if "user_id" not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    groq_messages = [{"role": "user", "content": data.get("prompt", "")}]
+    try:
+        resp = call_groq(groq_messages)
+        print(f"Groq status: {resp.status_code}, body: {resp.text[:300]}")
+        result = resp.json() if resp.headers.get("content-type","").startswith("application/json") else resp.text
+        text, err = extract_groq_text(result)
+        if err:
+            return jsonify({"error": err}), 500
+        return jsonify({"reply": text})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ─────────────────────────────────────────────
 #  STARTUP
